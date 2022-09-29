@@ -21,23 +21,23 @@ find_package(rosbag2_compression REQUIRED)
 find_package(rosbag2_cpp REQUIRED)
 find_package(rosbag2_storage REQUIRED)
 find_package(rosbag2_storage_mcap REQUIRED)
-find_package(rmw REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(sensor_msgs REQUIRED)
 find_package(yaml_cpp_vendor REQUIRED)
 
-add_executable(scratch
-  src/scratch.cpp)
+add_executable(single_benchmark
+  src/single_benchmark.cpp)
 
-ament_target_dependencies(scratch
+ament_target_dependencies(single_benchmark
   rclcpp
-  std_msgs
+  rcutils
   rosbag2_compression
   rosbag2_cpp
   rosbag2_storage
   yaml_cpp_vendor
 )
-install(TARGETS scratch
+install(TARGETS single_benchmark
+    DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS scripts/sweep.py
     DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)

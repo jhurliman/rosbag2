@@ -1,5 +1,6 @@
 #include <malloc.h>
 #include <random>
+#include <fstream>
 #include <climits>
 #include <algorithm>
 #include <functional>
@@ -9,26 +10,16 @@
 
 #include "rosbag2_cpp/writer.hpp"
 #include "rosbag2_storage/ros_helper.hpp"
+#include "rcutils/logging_macros.h"
 
-#ifdef _WIN32
-// This is necessary because of a bug in yaml-cpp's cmake
-#define YAML_CPP_DLL
-// This is necessary because yaml-cpp does not always use dllimport/dllexport consistently
-# pragma warning(push)
-# pragma warning(disable:4251)
-# pragma warning(disable:4275)
-#endif
 #include "yaml-cpp/yaml.h"
-#ifdef _WIN32
-# pragma warning(pop)
-#endif
 
 using RandomEngine = std::independent_bits_engine<std::default_random_engine, CHAR_BIT, unsigned char>;
 using hrc = std::chrono::high_resolution_clock;
 using Batch = std::vector<std::shared_ptr<const rosbag2_storage::SerializedBagMessage>>;
 
 struct Config {
-    std::string storage_id = "mcap";
+    std::string storage_id = "sqlite3";
     size_t batch_num_messages = 10;
     size_t repeat_message_count = 1000;
 
@@ -38,7 +29,7 @@ struct Config {
     };
     std::vector<TopicConfig> topics = { {"/large", 1000000 }, {"/small", 1000} };
 
-    std::unordered_map<std::string, std::string> plugin_config;
+    YAML::Node storage_config;
 };
 
 namespace YAML {
@@ -57,11 +48,7 @@ struct convert<Config> {
         topic_configs_node.push_back(topic_config_node);
     }
     node["topics"] = topic_configs_node;
-    Node plugin_config_node;
-    for (const auto& [k, v] : rhs.plugin_config) {
-        plugin_config_node[k] = v;
-    }
-    node["plugin_config"] = plugin_config_node;
+    node["storage_config"] = rhs.storage_config;
     return node;
   }
 
@@ -79,7 +66,7 @@ struct convert<Config> {
             rhs.topics.push_back(topic);
         }
     }
-    optional_assign<std::unordered_map<std::string, std::string>>(node, "plugin_config", rhs.plugin_config);
+    optional_assign<Node>(node, "storage_config", rhs.storage_config);
     return true;
   }
 };
@@ -173,23 +160,35 @@ struct WriteStat {
 };
 
 
-int main(int, const char**) {
-    Config config;
-    std::cerr << "generating topics" << std::endl;
+int main(int argc, const char** argv) {
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <config yaml string> <output dir>" << std::endl;
+        std::cerr << "Use ros2 run rosbag2_storage_plugin_comparison sweep.py for a more ergonomic experience" << std::endl;
+        return 1;
+    }
+    YAML::Node config_yaml = YAML::Load(argv[1]);
+    Config config = config_yaml.as<Config>();
+    RCUTILS_LOG_INFO_NAMED("single_benchmark", "generating %ld topics", config.topics.size());
     auto topics = generate_topics(config);
-    std::cerr << "generating " << config.repeat_message_count * config.topics.size() << " messages" << std::endl;
+    RCUTILS_LOG_INFO_NAMED("single_benchmark", "generating %ld messages", config.repeat_message_count * config.topics.size());
     auto messages = generate_messages(config);
-
-    std::cerr << "setting up writer" << std::endl;
+    RCUTILS_LOG_INFO_NAMED("single_benchmark", "configuring writer");
     rosbag2_storage::StorageFactory factory;
     rosbag2_storage::StorageOptions options;
-    options.uri = "out";
+    options.uri = std::string(argv[2]) + "/out";
     options.storage_id = config.storage_id;
+
+    if (config.storage_config.IsMap()) {
+        std::string storage_config_uri = std::string(argv[2]) + "/storage_config.yaml";
+        std::ofstream fout(storage_config_uri.c_str());
+        fout << config.storage_config;
+        options.storage_config_uri = storage_config_uri;
+    }
 
     std::vector<WriteStat> writeStats;
     writeStats.reserve(messages.size());
     std::chrono::high_resolution_clock::time_point close_start_time;
-    std::cerr << "starting writes" << std::endl;
+    RCUTILS_LOG_INFO_NAMED("single_benchmark", "writing messages");
     {
         auto writer = factory.open_read_write(options);
 

@@ -37,6 +37,8 @@ ament_target_dependencies(scratch
   rosbag2_storage
   yaml_cpp_vendor
 )
+install(TARGETS scratch
+    DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

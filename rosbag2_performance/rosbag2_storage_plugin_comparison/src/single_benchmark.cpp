@@ -20,16 +20,17 @@ using Batch = std::vector<std::shared_ptr<const rosbag2_storage::SerializedBagMe
 
 struct Config {
     std::string storage_id = "sqlite3";
-    size_t batch_num_messages = 10;
-    size_t repeat_message_count = 1000;
+    size_t min_batch_size_bytes = 10;
+    size_t write_total_bytes = 1000000000;
 
     struct TopicConfig {
         std::string name;
         size_t message_size;
+        double write_proportion = 1.0;
     };
-    std::vector<TopicConfig> topics = { {"/large", 1000000 }, {"/small", 1000} };
+    std::vector<TopicConfig> topics = { {"/large", 1000000, 0.8 }, {"/small", 1000, 0.1 } };
 
-    YAML::Node storage_config;
+    YAML::Node storage_options;
 };
 
 namespace YAML {
@@ -38,24 +39,25 @@ struct convert<Config> {
   static Node encode(const Config& rhs) {
     Node node;
     node["storage_id"] = rhs.storage_id;
-    node["batch_num_messages"] = rhs.batch_num_messages;
-    node["repeat_message_count"] = rhs.repeat_message_count;
+    node["min_batch_size_bytes"] = rhs.min_batch_size_bytes;
+    node["write_total_bytes"] = rhs.write_total_bytes;
     Node topic_configs_node;
     for (const auto& topic_config : rhs.topics) {
         Node topic_config_node;
         topic_config_node["name"] = topic_config.name;
         topic_config_node["message_size"] = topic_config.message_size;
+        topic_config_node["write_proportion"] = topic_config.write_proportion;
         topic_configs_node.push_back(topic_config_node);
     }
     node["topics"] = topic_configs_node;
-    node["storage_config"] = rhs.storage_config;
+    node["storage_options"] = rhs.storage_options;
     return node;
   }
 
   static bool decode(const Node& node, Config& rhs) {
     optional_assign<std::string>(node, "storage_id", rhs.storage_id);
-    optional_assign<size_t>(node, "batch_num_messages", rhs.batch_num_messages);
-    optional_assign<size_t>(node, "repeat_message_count", rhs.repeat_message_count);
+    optional_assign<size_t>(node, "min_batch_size_bytes", rhs.min_batch_size_bytes);
+    optional_assign<size_t>(node, "write_total_bytes", rhs.write_total_bytes);
     if (node["topics"]) {
         rhs.topics.clear();
         auto topics_node = node["topics"];
@@ -63,10 +65,11 @@ struct convert<Config> {
             Config::TopicConfig topic;
             topic.name = (*it)["name"].as<std::string>();
             topic.message_size = (*it)["message_size"].as<size_t>();
+            optional_assign<double>(*it, "write_proportion", topic.write_proportion);
             rhs.topics.push_back(topic);
         }
     }
-    optional_assign<Node>(node, "storage_config", rhs.storage_config);
+    optional_assign<Node>(node, "storage_options", rhs.storage_options);
     return true;
   }
 };
@@ -97,17 +100,33 @@ std::shared_ptr<rcutils_uint8_array_t> random_uint8_array(size_t size, RandomEng
 std::vector<Batch> generate_messages(Config config) {
     std::vector<Batch> out;
     Batch currentBatch;
+    size_t currentBatchBytes = 0;
     RandomEngine engine;
-    for (size_t i = 0; i < config.repeat_message_count; ++i) {
-        for (const auto& topic_config: config.topics) {
-            auto msg = std::make_shared<rosbag2_storage::SerializedBagMessage>();
-            msg->topic_name = topic_config.name;
-            msg->serialized_data = random_uint8_array(topic_config.message_size, engine);
-            currentBatch.push_back(msg);
-            if (currentBatch.size() >= config.batch_num_messages) {
-                out.emplace_back(std::move(currentBatch));
-                currentBatch = {};
-            }
+    std::default_random_engine shuffleEngine(0);
+    // TODO: check that the proportions sum to roughly one
+
+    std::vector<const Config::TopicConfig*> config_to_write;
+    for (size_t i = 0; i < config.topics.size(); ++i) {
+        const auto* topic_config = &config.topics[i];
+        double this_topic_bytes = (double)(config.write_total_bytes) * topic_config->write_proportion;
+        size_t num_msgs = (size_t)(this_topic_bytes / double(topic_config->message_size));
+        for (size_t j = 0; j < num_msgs; ++j) {
+            config_to_write.push_back(topic_config);
+        }
+    }
+    // shuffle the vector
+    std::shuffle(config_to_write.begin(), config_to_write.end(), shuffleEngine);
+
+    for (auto topic_config: config_to_write) {
+        auto msg = std::make_shared<rosbag2_storage::SerializedBagMessage>();
+        msg->topic_name = topic_config->name;
+        msg->serialized_data = random_uint8_array(topic_config->message_size, engine);
+        currentBatchBytes += topic_config->message_size;
+        currentBatch.push_back(msg);
+        if (currentBatchBytes >= config.min_batch_size_bytes) {
+            out.emplace_back(std::move(currentBatch));
+            currentBatch = {};
+            currentBatchBytes = 0;
         }
     }
     if (currentBatch.size() != 0) {
@@ -170,7 +189,7 @@ int main(int argc, const char** argv) {
     Config config = config_yaml.as<Config>();
     RCUTILS_LOG_INFO_NAMED("single_benchmark", "generating %ld topics", config.topics.size());
     auto topics = generate_topics(config);
-    RCUTILS_LOG_INFO_NAMED("single_benchmark", "generating %ld messages", config.repeat_message_count * config.topics.size());
+    RCUTILS_LOG_INFO_NAMED("single_benchmark", "generating some messages");
     auto messages = generate_messages(config);
     RCUTILS_LOG_INFO_NAMED("single_benchmark", "configuring writer");
     rosbag2_storage::StorageFactory factory;
@@ -178,11 +197,12 @@ int main(int argc, const char** argv) {
     options.uri = std::string(argv[2]) + "/out";
     options.storage_id = config.storage_id;
 
-    if (config.storage_config.IsMap()) {
-        std::string storage_config_uri = std::string(argv[2]) + "/storage_config.yaml";
-        std::ofstream fout(storage_config_uri.c_str());
-        fout << config.storage_config;
-        options.storage_config_uri = storage_config_uri;
+    if (config.storage_options.IsMap()) {
+        std::string storage_options_uri = std::string(argv[2]) + "/storage_options.yaml";
+        RCUTILS_LOG_INFO_NAMED("single_benchmark", "using storage options %s", storage_options_uri.c_str());
+        std::ofstream fout(storage_options_uri.c_str());
+        fout << config.storage_options;
+        options.storage_config_uri = storage_options_uri;
     }
 
     std::vector<WriteStat> writeStats;

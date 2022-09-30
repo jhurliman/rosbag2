@@ -1,3 +1,33 @@
+// Copyright 2022, Foxglove Technologies. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+ 
+/// @file single_benchmark.cpp
+/// @brief writes some number of messages to a bag file using the
+/// rosbag2_storage::ReadWriteInterface API, and measures timing and memory usage data for each
+/// write call.
+/// 
+/// Arguments:
+///   1. A YAML string to configure the benchmark run.
+///   2. a path to write the bag file to.
+/// 
+/// Prints a csv-formatted table containing metrics from each write call. This binary isn't meant
+/// to be called manually by humans, instead use `sweep.py` to run a parametric sweep across a range
+/// of configs.
+/// 
+/// Example usage:
+///  ./single_benchmark "$(cat your_config.yaml)" /tmp/some_bagfile_filename.bag > results.csv
+
 #include <malloc.h>
 #include <random>
 #include <fstream>
@@ -12,70 +42,18 @@
 #include "rosbag2_storage/ros_helper.hpp"
 #include "rcutils/logging_macros.h"
 
-#include "yaml-cpp/yaml.h"
+#include "config.hpp"
 
 using RandomEngine = std::independent_bits_engine<std::default_random_engine, CHAR_BIT, unsigned char>;
 using hrc = std::chrono::high_resolution_clock;
 using Batch = std::vector<std::shared_ptr<const rosbag2_storage::SerializedBagMessage>>;
 
-struct Config {
-    std::string storage_id = "sqlite3";
-    size_t min_batch_size_bytes = 10;
-    size_t write_total_bytes = 1000000000;
-
-    struct TopicConfig {
-        std::string name;
-        size_t message_size;
-        double write_proportion = 1.0;
-    };
-    std::vector<TopicConfig> topics = { {"/large", 1000000, 0.8 }, {"/small", 1000, 0.1 } };
-
-    YAML::Node storage_options;
-};
-
-namespace YAML {
-template<>
-struct convert<Config> {
-  static Node encode(const Config& rhs) {
-    Node node;
-    node["storage_id"] = rhs.storage_id;
-    node["min_batch_size_bytes"] = rhs.min_batch_size_bytes;
-    node["write_total_bytes"] = rhs.write_total_bytes;
-    Node topic_configs_node;
-    for (const auto& topic_config : rhs.topics) {
-        Node topic_config_node;
-        topic_config_node["name"] = topic_config.name;
-        topic_config_node["message_size"] = topic_config.message_size;
-        topic_config_node["write_proportion"] = topic_config.write_proportion;
-        topic_configs_node.push_back(topic_config_node);
-    }
-    node["topics"] = topic_configs_node;
-    node["storage_options"] = rhs.storage_options;
-    return node;
-  }
-
-  static bool decode(const Node& node, Config& rhs) {
-    optional_assign<std::string>(node, "storage_id", rhs.storage_id);
-    optional_assign<size_t>(node, "min_batch_size_bytes", rhs.min_batch_size_bytes);
-    optional_assign<size_t>(node, "write_total_bytes", rhs.write_total_bytes);
-    if (node["topics"]) {
-        rhs.topics.clear();
-        auto topics_node = node["topics"];
-        for (auto it = topics_node.begin(); it != topics_node.end(); ++it) {
-            Config::TopicConfig topic;
-            topic.name = (*it)["name"].as<std::string>();
-            topic.message_size = (*it)["message_size"].as<size_t>();
-            optional_assign<double>(*it, "write_proportion", topic.write_proportion);
-            rhs.topics.push_back(topic);
-        }
-    }
-    optional_assign<Node>(node, "storage_options", rhs.storage_options);
-    return true;
-  }
-};
-}
-
-
+/**
+ * @brief Generates the TopicMetadata objects needed by ReadWriteInterface before writing the
+ * topics produced by this benchmark.
+ * @param config the benchmark config for this run.
+ * @return std::vector<rosbag2_storage::TopicMetadata> all TopicMetadata objects to go into the bag.
+ */
 std::vector<rosbag2_storage::TopicMetadata> generate_topics(const Config& config) {
     std::vector<rosbag2_storage::TopicMetadata> topics;
     for (const auto& topic : config.topics) {
@@ -83,6 +61,8 @@ std::vector<rosbag2_storage::TopicMetadata> generate_topics(const Config& config
         metadata.name = topic.name;
         // The topic type doesn't matter here - we're not doing any serialization,
         // just throwing random bytes into the serialized message.
+        // It still needs to be a valid typename because the MCAP plugin will search the resource
+        // index for it.
         metadata.type = "std_msgs/String";
         metadata.serialization_format = "cdr";
         metadata.offered_qos_profiles = "";
@@ -91,50 +71,75 @@ std::vector<rosbag2_storage::TopicMetadata> generate_topics(const Config& config
     return topics;
 }
 
+/**
+ * @brief Produce a random byte array, suitable for the serialized_data field of SerializedBagMessage.
+ * 
+ * @param size The size of the array to produce
+ * @param engine The random number generator, shared between runs.
+ * @return std::shared_ptr<rcutils_uint8_array_t> A bytearray full of random data of length `size`.
+ */
 std::shared_ptr<rcutils_uint8_array_t> random_uint8_array(size_t size, RandomEngine& engine) {
     std::vector<unsigned char> data(size);
     std::generate(begin(data), end(data), std::ref(engine));
     return rosbag2_storage::make_serialized_message(data.data(), data.size());
 }
 
+/**
+ * @brief Generates all messages to write to the bag.
+ * 
+ * @param config The benchmark config for this run.
+ * @return std::vector<Batch> The messages to write in this run, broken up into Batches. Each
+ * batch is written to the bag in its own write() call.
+ */
 std::vector<Batch> generate_messages(Config config) {
     std::vector<Batch> out;
-    Batch currentBatch;
-    size_t currentBatchBytes = 0;
+    Batch current_batch;
+    size_t current_batch_bytes = 0;
     RandomEngine engine;
-    std::default_random_engine shuffleEngine(0);
-    // TODO: check that the proportions sum to roughly one
+    // We use a second random engine for shuffling the vector of messages, to ensure
+    // roughly-evenly-sized batches.
+    std::default_random_engine shuffle_engine(0);
 
+    // build a long vector of pointers to the relevant topic config for each message that will be
+    // created.
     std::vector<const Config::TopicConfig*> config_to_write;
+    double proportion_sum = 0.0;
     for (size_t i = 0; i < config.topics.size(); ++i) {
         const auto* topic_config = &config.topics[i];
+        proportion_sum += topic_config->write_proportion;
         double this_topic_bytes = (double)(config.write_total_bytes) * topic_config->write_proportion;
         size_t num_msgs = (size_t)(this_topic_bytes / double(topic_config->message_size));
         for (size_t j = 0; j < num_msgs; ++j) {
             config_to_write.push_back(topic_config);
         }
     }
-    // shuffle the vector
-    std::shuffle(config_to_write.begin(), config_to_write.end(), shuffleEngine);
+    if ((proportion_sum > 1.0001) || (proportion_sum < 0.9999)) {
+        throw std::runtime_error("topic config proportions do not sum close to 1");
+    }
+    // shuffle the messages to be created, to make the batches all roughly the same size.
+    std::shuffle(config_to_write.begin(), config_to_write.end(), shuffle_engine);
 
     for (auto topic_config: config_to_write) {
         auto msg = std::make_shared<rosbag2_storage::SerializedBagMessage>();
         msg->topic_name = topic_config->name;
         msg->serialized_data = random_uint8_array(topic_config->message_size, engine);
-        currentBatchBytes += topic_config->message_size;
-        currentBatch.push_back(msg);
-        if (currentBatchBytes >= config.min_batch_size_bytes) {
-            out.emplace_back(std::move(currentBatch));
-            currentBatch = {};
-            currentBatchBytes = 0;
+        current_batch_bytes += topic_config->message_size;
+        current_batch.push_back(msg);
+        if (current_batch_bytes >= config.min_batch_size_bytes) {
+            out.emplace_back(std::move(current_batch));
+            current_batch = {};
+            current_batch_bytes = 0;
         }
     }
-    if (currentBatch.size() != 0) {
-        out.emplace_back(std::move(currentBatch));
+    if (current_batch.size() != 0) {
+        out.emplace_back(std::move(current_batch));
     }
     return out;
 }
 
+/**
+ * @brief Returns the number of bytes in all messages in this batch.
+ */
 size_t message_bytes(const Batch& batch) {
     size_t total = 0;
     for (const auto& msgPtr : batch) {
@@ -143,38 +148,45 @@ size_t message_bytes(const Batch& batch) {
     return total;
 }
 
+/**
+ * @brief Contains the baseline memory usage of the application before creating a writer and calling
+ * `write()`.
+ */
 struct BaselineStat {
-    size_t arenaBytes;
-    size_t inUseBytes;
-    size_t mmapBytes;
+    size_t arena_bytes;
+    size_t in_use_bytes;
+    size_t mmap_bytes;
 
     BaselineStat() {
         struct mallinfo2 info = mallinfo2();
-        arenaBytes = info.arena;
-        inUseBytes = info.uordblks;
-        mmapBytes = info.hblkhd;
+        arena_bytes = info.arena;
+        in_use_bytes = info.uordblks;
+        mmap_bytes = info.hblkhd;
     }
 };
 
+/**
+ * @brief The metrics measured from a single writer.write() call.
+ */
 struct WriteStat {
     uint32_t sqc;
-    size_t bytesWritten;
-    size_t numMsgs;
-    hrc::duration writeDuration;
-    ssize_t arenaBytes;
-    ssize_t inUseBytes;
-    ssize_t mmapBytes;
+    size_t bytes_written;
+    size_t num_msgs;
+    hrc::duration write_duration;
+    ssize_t arena_bytes;
+    ssize_t in_use_bytes;
+    ssize_t mmap_bytes;
 
-    WriteStat(const BaselineStat& baselineStat, uint32_t sqc_, const Batch& batch, hrc::duration writeDuration) :
+    WriteStat(const BaselineStat& baseline_stat, uint32_t sqc_, const Batch& batch, hrc::duration write_duration) :
         sqc(sqc_),
-        bytesWritten(message_bytes(batch)),
-        numMsgs(batch.size()),
-        writeDuration(writeDuration)
+        bytes_written(message_bytes(batch)),
+        num_msgs(batch.size()),
+        write_duration(write_duration)
         {
             struct mallinfo2 info = mallinfo2();
-            arenaBytes = info.arena - baselineStat.arenaBytes;
-            inUseBytes = info.uordblks - baselineStat.inUseBytes;
-            mmapBytes = info.hblkhd - baselineStat.mmapBytes;
+            arena_bytes = info.arena - baseline_stat.arena_bytes;
+            in_use_bytes = info.uordblks - baseline_stat.in_use_bytes;
+            mmap_bytes = info.hblkhd - baseline_stat.mmap_bytes;
         }
 };
 
@@ -205,10 +217,11 @@ int main(int argc, const char** argv) {
         options.storage_config_uri = storage_options_uri;
     }
 
-    std::vector<WriteStat> writeStats;
-    writeStats.reserve(messages.size());
+    std::vector<WriteStat> write_stats;
+    write_stats.reserve(messages.size());
     std::chrono::high_resolution_clock::time_point close_start_time;
     RCUTILS_LOG_INFO_NAMED("single_benchmark", "writing messages");
+    BaselineStat baseline;
     {
         auto writer = factory.open_read_write(options);
 
@@ -216,14 +229,13 @@ int main(int argc, const char** argv) {
             writer->create_topic(topic);
         }
 
-        BaselineStat baseline;
         uint32_t sqc = 0;
         // write messages, timing each write
         for (const auto& message_batch : messages) {
             auto start_time = hrc::now();
             writer->write(message_batch);
             hrc::duration duration = hrc::now() - start_time;
-            writeStats.emplace_back(baseline, sqc, message_batch, duration);
+            write_stats.emplace_back(baseline, sqc, message_batch, duration);
             sqc++;
         }
 
@@ -233,16 +245,16 @@ int main(int argc, const char** argv) {
     auto close_duration = hrc::now() - close_start_time;
 
     std::cout << "sqc,num_bytes,num_msgs,write_ns,arena_bytes,in_use_bytes,mmap_bytes,close_ns" << std::endl;
-    for (const auto& stat : writeStats) {
-        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(stat.writeDuration).count();
+    for (const auto& stat : write_stats) {
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(stat.write_duration).count();
         std::cout <<
             stat.sqc << "," <<
-            stat.bytesWritten << "," <<
-            stat.numMsgs << "," <<
+            stat.bytes_written << "," <<
+            stat.num_msgs << "," <<
             duration << "," <<
-            stat.arenaBytes << "," <<
-            stat.inUseBytes << "," <<
-            stat.mmapBytes << "," <<
+            stat.arena_bytes << "," <<
+            stat.in_use_bytes << "," <<
+            stat.mmap_bytes << "," <<
             std::endl;
     }
     std::cout << ",,,,,,," << std::chrono::duration_cast<std::chrono::nanoseconds>(close_duration).count() << std::endl;

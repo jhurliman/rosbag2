@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+""" Runs a parametric sweep of runs measuring the throughput and memory usage of
+rosbag2_storage::BaseWriteInterface implementations. Writes a CSV summary of each run to
+stdout, or to a file if a path is provided.
+"""
 
-from hmac import digest
 from pathlib import Path
 import subprocess
 import shutil
@@ -11,7 +14,12 @@ from io import StringIO
 
 import yaml
 
+"""CONFIG_DIMENSIONS contains the parameters to sweep across and their values.
+CONFIG_DIMENSIONS is structured as `{ parameter label : { variant label : config fragment } }`.
+the function `build_configs()` iterates through the variants of each parameter and produces
+a config for each combination."""
 CONFIG_DIMENSIONS = {
+    # The size and distribution of messages to write.
     "messages": {
         "large": { "topics": [{"name": "/large", "message_size": 1_000_000}]},
         "medium": { "topics": [{"name": "/medium", "message_size": 10_000}]},
@@ -22,17 +30,26 @@ CONFIG_DIMENSIONS = {
             {"name": "/large", "message_size": 1_000_000, "write_proportion": 0.7},
         ]},
     },
+    # The size of batches to write in each write() call.
     "batch_size": {
         "small": { "min_batch_size_bytes": 1000 },
         "medium": { "min_batch_size_bytes": 1000000 },
         "large": { "min_batch_size_bytes": 100000000 },
     },
+    # Configuration parameters for the writer plugin to use.
     "plugin_config": {
         "mcap_default": {"storage_id": "mcap"},
         "mcap_nocrc": {
             "storage_id": "mcap",
             "storage_options": {
                 "noCRC": True,
+            }
+        },
+        "mcap_zstd": {
+            "storage_id": "mcap",
+            "storage_options": {
+                "chunkSize": 10_000_000,
+                "compression": "Zstd",
             }
         },
         "mcap_nochunking": {
@@ -57,9 +74,16 @@ CONFIG_DIMENSIONS = {
 
 
 def executable_path():
+    """Returns the path to the benchmark binary that actually writes the bag file.
+    This is separated out into a separate process so that all resources are cleaned up
+    between runs.
+    """
     return Path(__file__).resolve().parent / "single_benchmark"
 
 def build_configs():
+    """ Iterates through each combination of variants in CONFIG_DIMENSIONS and produces a list of
+    ({parameter label : variant label}, config) tuples.
+    """
     configs = [({}, {})]
     for dimension_name, dimension in CONFIG_DIMENSIONS.items():
         new_configs = []
@@ -75,11 +99,12 @@ def build_configs():
         configs = new_configs
     return configs
 
-def run_once(merged_config):
+def run_once(config):
+    """ Runs `single_benchmark` with the given config and returns the resulting CSV content. """
     outdir = Path(mkdtemp())
     try:
         res = subprocess.run(
-            [executable_path(), yaml.dump(merged_config), outdir],
+            [executable_path(), yaml.dump(config), outdir],
             check=True,
             stdout=subprocess.PIPE
         )
@@ -88,6 +113,7 @@ def run_once(merged_config):
     return res.stdout.decode("utf-8")
 
 def make_digest(name, csv_content):
+    """ Aggregates the results of one benchmark run into a row for the final digest CSV. """
     reader = csv.DictReader(StringIO(csv_content))
     write_times = []
     arena_sizes = []
@@ -106,7 +132,7 @@ def make_digest(name, csv_content):
             mmap_sizes.append(int(row["mmap_bytes"]))
     res = dict(**name)
     res.update({
-        "name": "-".join([f"{k}={v}" for k, v in name.items()]),
+        "name": ";".join([f"{k}={v}" for k, v in name.items()]),
         "avg_byte_throughput": sum(byte_throughputs) / len(byte_throughputs),
         "max_arena_size": max(arena_sizes),
         "max_in_use_size": max(in_use_sizes),
@@ -116,16 +142,18 @@ def make_digest(name, csv_content):
     return res
 
 
-def write_digest(outfile, digest_rows):
+def write_csv_from_dicts(outfile, rows):
+    """ takes a list of {column name: value} dicts and writes a CSV to a file-like object `outfile`. """
     writer = csv.DictWriter(
         outfile,
-        list(digest_rows[0].keys()),
+        list(rows[0].keys()),
     )
     writer.writeheader()
-    for row in digest_rows:
+    for row in rows:
         writer.writerow(row)
 
-if __name__ == "__main__":
+
+def main():
     configs = build_configs()
     digest_rows = []
     for name, config in configs:
@@ -134,14 +162,12 @@ if __name__ == "__main__":
         digest_rows.append(make_digest(name, result))
     if len(sys.argv) > 1:
         with open(sys.argv[1], "w") as f:
-            write_digest(f, digest_rows)
+            write_csv_from_dicts(f, digest_rows)
     else:
         s = StringIO()
-        write_digest(s, digest_rows)
+        write_csv_from_dicts(s, digest_rows)
         print(s.getvalue())
 
-    
 
-
-    
-    
+if __name__ == "__main__":
+    main()

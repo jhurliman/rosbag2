@@ -24,7 +24,8 @@ find_package(rosbag2_storage_mcap REQUIRED)
 find_package(yaml_cpp_vendor REQUIRED)
 
 add_executable(single_benchmark
-  src/single_benchmark.cpp)
+  src/single_benchmark.cpp
+  src/config.hpp)
 
 ament_target_dependencies(single_benchmark
   rclcpp

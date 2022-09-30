@@ -158,7 +158,7 @@ def main():
     digest_rows = []
     for name, config in configs:
         print(f"Running benchmark: {name}...", file=sys.stderr)
-        result = run_once(merged_config=config)
+        result = run_once(config)
         digest_rows.append(make_digest(name, result))
     if len(sys.argv) > 1:
         with open(sys.argv[1], "w") as f:

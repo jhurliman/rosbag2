@@ -26,7 +26,7 @@
 /// of configs.
 /// 
 /// Example usage:
-///  ./single_benchmark "$(cat your_config.yaml)" /tmp/some_bagfile_filename.bag > results.csv
+///  ./single_benchmark "$(cat your_config.yaml)" /tmp/some_existing_temp_dir > results.csv
 
 #include <malloc.h>
 #include <random>

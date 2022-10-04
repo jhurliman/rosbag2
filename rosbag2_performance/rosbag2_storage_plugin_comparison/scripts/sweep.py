@@ -33,8 +33,7 @@ CONFIG_DIMENSIONS = {
     # The size of batches to write in each write() call.
     "batch_size": {
         "small": { "min_batch_size_bytes": 1000 },
-        "medium": { "min_batch_size_bytes": 1000000 },
-        "large": { "min_batch_size_bytes": 100000000 },
+        "default": { "min_batch_size_bytes": 10000000 },
     },
     # Configuration parameters for the writer plugin to use.
     "plugin_config": {
@@ -45,11 +44,18 @@ CONFIG_DIMENSIONS = {
                 "noCRC": True,
             }
         },
-        "mcap_zstd": {
+        "mcap_zstdfast": {
             "storage_id": "mcap",
             "storage_options": {
                 "chunkSize": 10_000_000,
                 "compression": "Zstd",
+                "compressionLevel": "Fastest",
+            }
+        },
+        "mcap_uncompressed": {
+            "storage_id": "mcap",
+            "storage_options": {
+                "compression": "None",
             }
         },
         "mcap_nochunking": {

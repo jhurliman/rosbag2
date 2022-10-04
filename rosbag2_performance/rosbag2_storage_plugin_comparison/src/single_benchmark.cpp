@@ -80,7 +80,7 @@ std::vector<rosbag2_storage::TopicMetadata> generate_topics(const Config& config
  */
 std::shared_ptr<rcutils_uint8_array_t> random_uint8_array(size_t size, RandomEngine& engine) {
     std::vector<unsigned char> data(size);
-    std::generate(begin(data), end(data), std::ref(engine));
+    // std::generate(begin(data), end(data), std::ref(engine));
     return rosbag2_storage::make_serialized_message(data.data(), data.size());
 }
 

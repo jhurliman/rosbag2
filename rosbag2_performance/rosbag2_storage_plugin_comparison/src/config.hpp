@@ -22,7 +22,7 @@ struct Config {
     /// A small limit (like 10) means that only one message will be in each batch.
     size_t min_batch_size_bytes = 10;
     /// The number of bytes to write in total. Defaults to 1G.
-    size_t write_total_bytes = 1'000'000'000;
+    size_t write_total_bytes = 250'000'000;
 
     /// A set of topics to write to the bag. All messages contain only random data and the
     /// topics are meaningless except as unique labels for data of different sizes.

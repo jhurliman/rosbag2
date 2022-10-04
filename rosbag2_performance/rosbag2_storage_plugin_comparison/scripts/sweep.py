@@ -73,6 +73,13 @@ CONFIG_DIMENSIONS = {
 }
 
 
+def should_ignore(name_dict):
+    return (
+        name_dict.get("plugin_config", "").startswith("mcap_") and
+        name_dict.get("batch_size", "") in ["medium", "large"]
+    )
+
+
 def executable_path():
     """Returns the path to the benchmark binary that actually writes the bag file.
     This is separated out into a separate process so that all resources are cleaned up
@@ -93,6 +100,9 @@ def build_configs():
                 new_name = label if existing_name == "" else f"{existing_name}-{label}"
                 new_name = dict(**existing_name)
                 new_name[dimension_name] = variant_name
+                if should_ignore(new_name):
+                    print(f"ignoring configuration {new_name}", file=sys.stderr)
+                    continue
                 new_config = dict(**existing_config)
                 new_config.update(variant_fragment)
                 new_configs.append((new_name, new_config))

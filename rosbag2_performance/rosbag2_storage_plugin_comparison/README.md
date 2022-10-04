@@ -14,7 +14,7 @@ colcon build --packages-up-to rosbag2_storage_plugin_comparison
 
 ### Running the benchmark
 ```
-ros2 pkg run rosbag2_storage_plugin_comparison sweep.py results.csv
+ros2 run rosbag2_storage_plugin_comparison sweep.py results.csv
 ```
 
 ### Interpreting the results
